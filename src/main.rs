@@ -1,16 +1,24 @@
+mod editor;
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write, Seek, SeekFrom, Stdout};
 
-use crossterm::{event::{
-    self,
-    Event,
-    KeyCode,
-    KeyModifiers,
-    KeyEventKind
-}, cursor, terminal, style::{
-    self,
-    Color
-}, QueueableCommand};
+use crossterm::{
+    event::{
+        self,
+        Event,
+        KeyCode,
+        KeyModifiers,
+        KeyEventKind
+    },
+    style::{
+        self,
+        Color
+    },
+    cursor,
+    terminal,
+    QueueableCommand
+};
 
 struct SelectWindow {
     begin: usize,
