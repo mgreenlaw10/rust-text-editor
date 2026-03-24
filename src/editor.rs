@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read, Write, Stdout};
+use std::io::{self, Read, Write, Stdout, SeekFrom, Seek};
 
 use crossterm::{
     style::{
@@ -16,7 +16,7 @@ use crossterm::{
     QueueableCommand
 };
 
-struct Editor {
+pub struct Editor {
     file: File,
     file_name: String,
     stdout: Stdout,
@@ -63,30 +63,74 @@ impl Editor {
         self.data_buffer.insert(self.buffer_pos, c);
     }
 
-    pub fn move_pointer_right(&mut self, num_chars: usize) {
-        let _ = self.buffer_pos.saturating_add(num_chars);
-        self.buffer_pos = self.buffer_pos.clamp(0, self.data_buffer.len());
+    pub fn delete_char(&mut self) {
+        self.data_buffer.remove(self.buffer_pos);
+    }
+
+    // Will clamp to the current row.
+    // Return the amount of cols actually moved.
+    pub fn move_cols(&mut self, num_cols: isize) -> usize {
+
+        let original_pos = self.buffer_pos as isize;
+
+        self.buffer_pos = self.buffer_pos.saturating_add_signed(num_cols);
+        self.buffer_pos = self.buffer_pos.clamp(0, self.data_buffer.chars().count());
         self.update_cursor_position();
+
+        (original_pos - self.buffer_pos as isize).abs() as usize
     }
 
-    pub fn move_pointer_left(&mut self, num_chars: usize) {
-        let _ = self.buffer_pos.saturating_sub(num_chars);
-        self.buffer_pos = self.buffer_pos.clamp(0, self.data_buffer.len());
-        self.update_cursor_position();
-    }
-
-    pub fn move_cols(&mut self, num_cols: usize) {
-
-    }
-
-    pub fn move_rows(&mut self, num_rows: i16) {
+    // Will clamp to the current col.
+    // Return the amount of rows actually moved.
+    pub fn move_rows(&mut self, num_rows: i16) -> usize {
 
         let (col, row) = self.cursor_pos;
-        let target_row = row.saturating_add_signed(num_rows);
-        let target_col = col;
+        let original_pos = self.buffer_pos as isize;
+        let final_row = self.data_buffer.lines().count() as u16 - 1;
 
-        self.cursor_pos = (target_col, target_row);
+        let target_row = row.saturating_add_signed(num_rows);
+
+        self.cursor_pos = (col, target_row.clamp(0, final_row));
         self.update_buffer_position();
+
+        (original_pos - self.buffer_pos as isize).abs() as usize
+    }
+
+    pub fn move_next_line(&mut self) -> Result<(), ()>{
+        let mut ptr = self.buffer_pos;
+        loop {
+            if let Some(c) = self.data_buffer.chars().nth(ptr) {
+                if c == '\n' {
+                    self.buffer_pos = ptr + 1;
+                    self.update_cursor_position();
+                    return Ok(());
+                }
+                else {
+                    ptr += 1;
+                }
+            }
+            else {
+                // If at end of file, append a new line
+                self.insert_char('\n');
+                self.buffer_pos = ptr + 1;
+                self.update_cursor_position();
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn save_file(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(self.data_buffer.as_bytes())?;
+        self.file.flush()?;
+
+        Ok(())
+    }
+
+    pub fn set_status(&mut self, status: String) {
+        self.status = Some(status);
     }
 
     pub fn redraw(&mut self) {
@@ -97,14 +141,22 @@ impl Editor {
 
         self.stdout.flush()
             .expect("Failed to flush stdout!");
+
+        // Restore cursor to its place
+        crossterm::execute!(self.stdout, MoveTo(self.cursor_pos.0, self.cursor_pos.1))
+            .expect("Failed to move to cursor!");
     }
 
     // Sync the cursor pos when the buffer pos is changed manually.
     fn update_cursor_position(&mut self) {
+
         let mut x = 0u16;
         let mut y = 0u16;
 
-        for ch in self.data_buffer.chars().take(self.buffer_pos) {
+        for ch in self.data_buffer
+                .chars()
+                .take(self.buffer_pos) {
+
             if ch == '\n' {
                 x = 0;
                 y += 1;
@@ -117,13 +169,19 @@ impl Editor {
 
     // Sync the buffer pos when the cursor pos is changed manually.
     fn update_buffer_position(&mut self) -> usize {
+
         let mut buffer_pos = 0usize;
         let (col, row) = self.cursor_pos;
         let mut lines = self.data_buffer.lines();
 
         for _ in 0..row {
-            // Increment because lines() removes '\n'
-            buffer_pos += lines.next().unwrap().len() + 1;
+            if let Some(line) = lines.next() {
+                // Increment because lines() removes '\n'
+                buffer_pos += line.len() + 1;
+            }
+            else {
+                break;
+            }
         }
         buffer_pos + col as usize
     }
@@ -180,5 +238,13 @@ impl Editor {
             )
                 .expect("Failed to write status!");
         }
+    }
+
+    pub fn cursor_pos(&self) -> (u16, u16) {
+        self.cursor_pos
+    }
+
+    pub fn buffer_pos(&self) -> usize {
+        self.buffer_pos
     }
 }
