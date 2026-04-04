@@ -2,24 +2,21 @@ use std::fs::File;
 use std::io::{self, Read, Write, Stdout, SeekFrom, Seek};
 use std::mem::swap;
 use std::ops::Add;
-use crossterm::{
-    style::{
-        Print,
-        Color,
-        Attribute,
-        SetAttribute,
-        SetBackgroundColor,
-        ResetColor,
-    },
-    cursor::{
-        MoveTo
-    },
-    terminal::{
-        Clear,
-        ClearType
-    },
-    QueueableCommand
-};
+use crossterm::{style::{
+    Print,
+    Color,
+    Attribute,
+    SetAttribute,
+    SetBackgroundColor,
+    ResetColor,
+}, cursor::{
+    MoveTo
+}, terminal::{
+    Clear,
+    ClearType
+}, QueueableCommand, terminal};
+
+use crate::snapshot_controller::SnapshotController;
 
 pub struct StatusLog {
     log: Vec<String>,
@@ -50,10 +47,14 @@ pub struct Editor {
     buffer_pos: usize,
     cursor_pos: (u16, u16),
 
-    status: Option<String>,
     header: Option<String>,
 
-    status_log: StatusLog
+    status_log: StatusLog,
+
+    file_state_controller: SnapshotController,
+
+    // number of rows scrolled from top
+    row_offset: usize
 }
 
 #[derive(Clone, Copy)]
@@ -77,8 +78,10 @@ impl Editor {
 
         // Load file into buffer
         let mut data_buffer = String::new();
+        
         file.read_to_string(&mut data_buffer)
             .expect("Failed to read data from {file_name}!");
+        let state = data_buffer.clone();
 
         // Todo: cache buffer position and load it here
         let buffer_pos = 0;
@@ -91,9 +94,10 @@ impl Editor {
             select_window: None,
             buffer_pos,
             cursor_pos: (0, 0),
-            status: None,
             header: None,
-            status_log: StatusLog::new(5)
+            status_log: StatusLog::new(5),
+            file_state_controller: SnapshotController::new(state, (0, 0)),
+            row_offset: 0
         }
     }
 
@@ -102,21 +106,49 @@ impl Editor {
             let window = self.select_window.unwrap();
             self.data_buffer.drain(window.get_left()..window.get_right());
             self.buffer_pos = window.get_left();
-            self.update_cursor_position();
+            self.data_buffer.insert(self.buffer_pos, c);
         }
-        self.data_buffer.insert(self.buffer_pos, c);
+        else {
+            self.data_buffer.insert(self.buffer_pos, c);
+        }
+        self.buffer_pos = self.buffer_pos.saturating_add(1);
+        self.buffer_pos = self.buffer_pos.clamp(0, self.data_buffer.len());
+
+        self.update_cursor_position();
+        self.save_snapshot();
     }
 
     pub fn delete_char(&mut self) {
         if self.select_window.is_none() {
+            self.buffer_pos = self.buffer_pos.saturating_sub(1);
             self.data_buffer.remove(self.buffer_pos);
         }
         else {
             let window = self.select_window.unwrap();
             self.data_buffer.drain(window.get_left()..window.get_right());
             self.buffer_pos = window.get_left();
-            self.update_cursor_position();
+
         }
+        self.update_cursor_position();
+        self.save_snapshot();
+    }
+
+    pub fn save_snapshot(&mut self) {
+        self.file_state_controller.push_snapshot(self.data_buffer.clone(), self.cursor_pos());
+    }
+
+    pub fn undo(&mut self) {
+        self.file_state_controller.move_pointer(-1);
+        self.data_buffer = self.file_state_controller.get_current_snapshot().data;
+        self.cursor_pos = self.file_state_controller.get_current_snapshot().cursor_pos;
+        self.update_buffer_position();
+    }
+
+    pub fn redo(&mut self) {
+        self.file_state_controller.move_pointer(1);
+        self.data_buffer = self.file_state_controller.get_current_snapshot().data;
+        self.cursor_pos = self.file_state_controller.get_current_snapshot().cursor_pos;
+        self.update_buffer_position();
     }
 
     // Will clamp to the current row.
@@ -178,14 +210,6 @@ impl Editor {
         }
     }
 
-    pub fn select_window_active(&mut self) -> bool {
-        self.select_window.is_some()
-    }
-
-    pub fn close_select_window(&mut self) {
-        self.select_window = None;
-    }
-
     pub fn drag_cols(&mut self, num_cols: isize) -> usize {
         let original_pos = self.buffer_pos;
         let cols_moved = self.move_cols(num_cols);
@@ -240,12 +264,61 @@ impl Editor {
         Ok(())
     }
 
-    pub fn log(&mut self, message: String) {
-        self.status_log.print(&message);
+    // Drag to the end of the word under the cursor
+    pub fn snap_drag_right(&mut self) {
+        if let Some(next_space_pos) = self.get_next_char_pos(' ') {
+            let distance = next_space_pos as isize - self.buffer_pos as isize;
+            self.drag_cols(distance);
+        }
+        else {
+            self.drag_cols(isize::MAX);
+        }
     }
 
-    pub fn set_status(&mut self, status: String) {
-        self.status = Some(status);
+    pub fn snap_drag_left(&mut self) {
+        if let Some(last_space_pos) = self.get_last_char_pos(' ') {
+            let distance = last_space_pos as isize - self.buffer_pos as isize;
+            self.drag_cols(distance);
+        }
+    }
+
+    pub fn get_next_char_pos(&mut self, c: char) -> Option<usize> {
+        if let Some(pos) = self.data_buffer[self.buffer_pos..]
+            .chars()
+            .position(|fc| fc == c) {
+            return Some(pos + self.buffer_pos);
+        }
+        None
+    }
+
+    pub fn get_last_char_pos(&mut self, c: char) -> Option<usize> {
+        self.data_buffer[..self.buffer_pos]
+            .chars()
+            .position(|fc| fc == c)
+    }
+
+    pub fn page_down(&mut self) {
+        self.row_offset += terminal::size().unwrap().1 as usize;
+        self.row_offset = self.row_offset.clamp(0, self.data_buffer.lines().count());
+        self.update_buffer_position();
+    }
+
+    pub fn page_up(&mut self) {
+        self.row_offset = self.row_offset.saturating_sub(terminal::size().unwrap().1 as usize);
+        self.row_offset = self.row_offset.clamp(0, self.data_buffer.lines().count());
+        self.update_buffer_position();
+    }
+
+    pub fn select_window_active(&mut self) -> bool {
+        self.select_window.is_some()
+    }
+
+    pub fn close_select_window(&mut self) {
+        self.select_window = None;
+    }
+
+    pub fn log(&mut self, message: String) {
+        self.status_log.print(&message);
     }
 
     pub fn redraw(&mut self) {
@@ -269,9 +342,11 @@ impl Editor {
         let mut x = 0u16;
         let mut y = 0u16;
 
+        let chars_before_screen = self.num_chars_before_screen();
+
         for ch in self.data_buffer
                 .chars()
-                .take(self.buffer_pos) {
+                .take(self.buffer_pos - chars_before_screen) {
 
             if ch == '\n' {
                 x = 0;
@@ -283,11 +358,20 @@ impl Editor {
         self.cursor_pos = (x, y);
     }
 
+    pub fn num_chars_before_screen(&mut self) -> usize {
+        let mut chars = 0;
+        for i in 0..self.row_offset {
+            chars += self.data_buffer.lines().nth(i).unwrap().len();
+        }
+        chars
+    }
+
     // Sync the buffer pos when the cursor pos is changed manually.
     fn update_buffer_position(&mut self) {
 
         let mut buffer_pos = 0usize;
-        let (col, row) = self.cursor_pos;
+        let (col, mut row) = self.cursor_pos;
+        row += self.row_offset as u16;
         let mut lines = self.data_buffer.lines();
 
         for _ in 0..row {
@@ -340,12 +424,30 @@ impl Editor {
     }
 
     fn queue_write_data_buffer(&mut self) {
+
+        // Write visible lines from row_offset to the end of the terminal
+        let available_rows = terminal::size()
+            .expect("Failed to get terminal size!")
+            .1 - self.status_log.lines;
+
         if self.select_window.is_none() {
-            crossterm::queue! (
-                self.stdout,
-                Print(&self.data_buffer),
-            )
-                .expect("Failed to write data buffer!");
+            for i in self.row_offset..self.row_offset + available_rows as usize {
+                if let Some(line) = self.data_buffer.lines().nth(i) {
+                    crossterm::queue!(
+                        self.stdout,
+                        Print(format!("{}\n", line)),
+                    ).expect("Failed to print line!");
+                }
+                else {
+                    //self.log(String::from("Ran out of lines!"));
+                    break;
+                }
+            }
+            // crossterm::queue! (
+            //     self.stdout,
+            //     Print(&self.data_buffer),
+            // )
+            //     .expect("Failed to write data buffer!");
         }
         else {
             let window = self.select_window.unwrap();
@@ -362,22 +464,6 @@ impl Editor {
                 Print(&self.data_buffer[r..]),
             )
                 .expect("Failed to write data buffer!");
-        }
-    }
-
-    fn queue_write_status(&mut self) {
-        // Skip if status doesn't exist
-        if let Some(ref status) = self.status {
-
-            let (_, h) = crossterm::terminal::size()
-                .expect("Failed to get terminal size!");
-
-            crossterm::queue! (
-                self.stdout,
-                MoveTo(0, h.saturating_sub(1)),
-                Print(status),
-            )
-                .expect("Failed to write status!");
         }
     }
 

@@ -1,5 +1,7 @@
 mod editor;
 mod terminal_controller;
+mod snapshot_controller;
+mod text_buffer;
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write, Seek, SeekFrom, Stdout};
@@ -21,28 +23,6 @@ use crossterm::{
     terminal,
     QueueableCommand
 };
-
-struct SelectWindow {
-    begin: usize,
-    end: usize,
-}
-
-struct State {
-    opened_file: File,
-    opened_file_name: String,
-    char_buffer: String,
-    buffer_pos: usize,
-    buffer_pos_outdated: bool,
-    stdout: Stdout,
-
-    status: String,
-    tab_width: usize,
-    header: String,
-
-    select_window: Option<SelectWindow>,
-}
-
-const HEADER_HEIGHT: u16 = 0;
 
 fn main() {
 
@@ -102,7 +82,7 @@ fn start_loop(editor: &mut Editor) {
             }
 
             match event.code {
-
+                // SAVE
                 KeyCode::Char('s') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                     match editor.save_file() {
                         Ok(_) => {
@@ -114,20 +94,31 @@ fn start_loop(editor: &mut Editor) {
                     }
 
                 }
+                // UNDO
+                KeyCode::Char('z') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    editor.undo();
+                    log_positions(editor);
+                }
+                // REDO
+                KeyCode::Char('y') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    editor.redo();
+                    log_positions(editor);
+                }
+
                 KeyCode::Char(c) => {
                     editor.insert_char(c);
-                    editor.move_cols(1);
                     editor.close_select_window();
+                    log_positions(editor);
                 }
                 KeyCode::Backspace => {
-                    if editor.move_cols(-1) > 0 {
-                        editor.delete_char();
-                    }
+                    editor.delete_char();
+
                     editor.close_select_window();
+                    log_positions(editor);
                 }
                 KeyCode::Enter => {
                     editor.insert_char('\n');
-                    editor.move_cols(1);
+                    log_positions(editor);
                 }
                 KeyCode::Tab => {
                     //todo
@@ -135,15 +126,30 @@ fn start_loop(editor: &mut Editor) {
                     // editor.move_cols(1);
                 }
                 KeyCode::Up => {
-                    editor.move_rows(-1);
+                    if event.modifiers.contains(KeyModifiers::CONTROL) {
+                        editor.page_up();
+                    }
+                    else {
+                        editor.move_rows(-1);
+                    }
                     log_positions(editor);
                 }
                 KeyCode::Down => {
-                    editor.move_rows(1);
+                    if event.modifiers.contains(KeyModifiers::CONTROL) {
+                        editor.page_down();
+                    }
+                    else {
+                        editor.move_rows(1);
+                    }
                     log_positions(editor);
                 }
                 KeyCode::Left => {
-                    if event.modifiers.contains(KeyModifiers::SHIFT) {
+                    if event.modifiers.contains(KeyModifiers::CONTROL)
+                    && event.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        editor.snap_drag_left();
+                    }
+                    else if event.modifiers.contains(KeyModifiers::SHIFT) {
                         editor.drag_cols(-1);
                     }
                     else if editor.move_cols(-1) == 0 {
@@ -155,7 +161,12 @@ fn start_loop(editor: &mut Editor) {
                     log_positions(editor);
                 }
                 KeyCode::Right => {
-                    if event.modifiers.contains(KeyModifiers::SHIFT) {
+                    if event.modifiers.contains(KeyModifiers::CONTROL)
+                        && event.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        editor.snap_drag_right();
+                    }
+                    else if event.modifiers.contains(KeyModifiers::SHIFT) {
                         editor.drag_cols(1);
                     }
                     else if editor.move_cols(1) == 0 {
